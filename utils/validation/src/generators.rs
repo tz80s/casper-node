@@ -12,7 +12,10 @@ use casper_types::{
     package::{
         ContractPackageKind, ContractPackageStatus, ContractVersions, DisabledVersions, Groups,
     },
-    system::auction::{Bid, EraInfo, SeigniorageAllocation, UnbondingPurse, WithdrawPurse},
+    system::auction::{
+        Bid, BidKind, Delegator, EraInfo, SeigniorageAllocation, UnbondingPurse, ValidatorBid,
+        WithdrawPurse,
+    },
     AccessRights, AddressableEntity, CLType, CLTyped, CLValue, ContractHash, ContractPackageHash,
     ContractVersionKey, ContractWasm, ContractWasmHash, DeployHash, DeployInfo, EntryPoint,
     EntryPointAccess, EntryPointType, EntryPoints, EraId, Group, Key, NamedKey, Package, Parameter,
@@ -107,13 +110,38 @@ pub fn make_abi_test_fixtures() -> Result<TestFixtures, Error> {
         era_info
     };
 
-    let bid = Bid::locked(
-        PublicKey::from(&validator_secret_key),
+    let validator_public_key = PublicKey::from(&validator_secret_key);
+    let validator_bid = ValidatorBid::locked(
+        validator_public_key.clone(),
         URef::new([10; 32], AccessRights::READ_ADD_WRITE),
         U512::from(50_000_000_000u64),
         100,
         u64::MAX,
     );
+    let validator_bid_kind = BidKind::Validator(Box::new(validator_bid));
+    let delegator_bid = Delegator::locked(
+        PublicKey::from(&delegator_secret_key),
+        U512::from(1_000_000_000u64),
+        URef::new([11; 32], AccessRights::READ_ADD_WRITE),
+        validator_public_key.clone(),
+        u64::MAX,
+    );
+    let delegator_bid_kind = BidKind::Delegator(Box::new(delegator_bid.clone()));
+
+    let unified_bid = {
+        let mut unified_bid = Bid::locked(
+            validator_public_key,
+            URef::new([10; 32], AccessRights::READ_ADD_WRITE),
+            U512::from(50_000_000_000u64),
+            100,
+            u64::MAX,
+        );
+        unified_bid
+            .delegators_mut()
+            .insert(delegator_bid.delegator_public_key().clone(), delegator_bid);
+        unified_bid
+    };
+
     let withdraw_purse_1 = WithdrawPurse::new(
         URef::new([10; 32], AccessRights::READ),
         PublicKey::from(&validator_secret_key),
@@ -194,7 +222,21 @@ pub fn make_abi_test_fixtures() -> Result<TestFixtures, Error> {
 
         transform.insert(
             "WriteBid".to_string(),
-            ABITestCase::from_inputs(vec![Transform::WriteBid(Box::new(bid.clone())).into()])?,
+            ABITestCase::from_inputs(vec![Transform::WriteBid(Box::new(unified_bid)).into()])?,
+        );
+
+        transform.insert(
+            "WriteBidKind".to_string(),
+            ABITestCase::from_inputs(vec![
+                Transform::WriteBidKind(validator_bid_kind.clone()).into()
+            ])?,
+        );
+
+        transform.insert(
+            "WriteBidKind".to_string(),
+            ABITestCase::from_inputs(vec![
+                Transform::WriteBidKind(delegator_bid_kind.clone()).into()
+            ])?,
         );
 
         transform.insert(
@@ -403,7 +445,11 @@ pub fn make_abi_test_fixtures() -> Result<TestFixtures, Error> {
         );
         stored_value.insert(
             "Bid".to_string(),
-            ABITestCase::from_inputs(vec![StoredValue::Bid(Box::new(bid)).into()])?,
+            ABITestCase::from_inputs(vec![StoredValue::Bid(validator_bid_kind).into()])?,
+        );
+        stored_value.insert(
+            "Bid".to_string(),
+            ABITestCase::from_inputs(vec![StoredValue::Bid(delegator_bid_kind).into()])?,
         );
         stored_value.insert(
             "Withdraw".to_string(),

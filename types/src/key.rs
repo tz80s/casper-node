@@ -23,6 +23,8 @@ use rand::{
     distributions::{Distribution, Standard},
     Rng,
 };
+#[cfg(feature = "json-schema")]
+use schemars::JsonSchema;
 use serde::{de::Error as SerdeError, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
@@ -33,6 +35,7 @@ use crate::{
     checksummed_hex,
     contract_wasm::ContractWasmHash,
     package::ContractPackageHash,
+    system::auction::{BidAddr, BidAddrTag},
     uref::{self, URef, URefAddr, UREF_SERIALIZED_LENGTH},
     DeployHash, Digest, EraId, Tagged, TransferAddr, TransferFromStrError, TRANSFER_ADDR_LENGTH,
     UREF_ADDR_LENGTH,
@@ -65,6 +68,7 @@ pub const KEY_DICTIONARY_LENGTH: usize = 32;
 pub const DICTIONARY_ITEM_KEY_MAX_LENGTH: usize = 128;
 const PADDING_BYTES: [u8; 32] = [0u8; 32];
 const KEY_ID_SERIALIZED_LENGTH: usize = 1;
+const BID_TAG_SERIALIZED_LENGTH: usize = 1;
 // u8 used to determine the ID
 const KEY_HASH_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
 const KEY_UREF_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + UREF_SERIALIZED_LENGTH;
@@ -72,7 +76,10 @@ const KEY_TRANSFER_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_TRA
 const KEY_DEPLOY_INFO_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_DEPLOY_INFO_LENGTH;
 const KEY_ERA_INFO_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + U64_SERIALIZED_LENGTH;
 const KEY_BALANCE_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + UREF_ADDR_LENGTH;
-const KEY_BID_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
+const KEY_VALIDATOR_BID_SERIALIZED_LENGTH: usize =
+    KEY_ID_SERIALIZED_LENGTH + BID_TAG_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
+const KEY_DELEGATOR_BID_SERIALIZED_LENGTH: usize =
+    KEY_VALIDATOR_BID_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
 const KEY_WITHDRAW_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
 const KEY_UNBOND_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_HASH_LENGTH;
 const KEY_DICTIONARY_SERIALIZED_LENGTH: usize = KEY_ID_SERIALIZED_LENGTH + KEY_DICTIONARY_LENGTH;
@@ -83,6 +90,8 @@ const KEY_CHAINSPEC_REGISTRY_SERIALIZED_LENGTH: usize =
     KEY_ID_SERIALIZED_LENGTH + PADDING_BYTES.len();
 const KEY_CHECKSUM_REGISTRY_SERIALIZED_LENGTH: usize =
     KEY_ID_SERIALIZED_LENGTH + PADDING_BYTES.len();
+
+const MAX_SERIALIZED_LENGTH: usize = KEY_DELEGATOR_BID_SERIALIZED_LENGTH;
 
 /// An alias for [`Key`]s hash variant.
 pub type HashAddr = [u8; KEY_HASH_LENGTH];
@@ -116,6 +125,7 @@ pub enum KeyTag {
 #[repr(C)]
 #[derive(PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "datasize", derive(DataSize))]
+#[cfg_attr(feature = "json-schema", derive(JsonSchema))]
 pub enum Key {
     /// A `Key` under which a user account is stored.
     Account(AccountHash),
@@ -133,7 +143,7 @@ pub enum Key {
     /// A `Key` under which we store a purse balance.
     Balance(URefAddr),
     /// A `Key` under which we store bid information
-    Bid(AccountHash),
+    Bid(BidAddr),
     /// A `Key` under which we store withdraw information.
     Withdraw(AccountHash),
     /// A `Key` variant whose value is derived by hashing [`URef`]s address and arbitrary data.
@@ -272,7 +282,7 @@ impl Key {
 
     /// Returns the maximum size a [`Key`] can be serialized into.
     pub const fn max_serialized_length() -> usize {
-        KEY_UREF_SERIALIZED_LENGTH
+        MAX_SERIALIZED_LENGTH
     }
 
     /// If `self` is of type [`Key::URef`], returns `self` with the
@@ -306,8 +316,8 @@ impl Key {
             Key::Balance(uref_addr) => {
                 format!("{}{}", BALANCE_PREFIX, base16::encode_lower(&uref_addr))
             }
-            Key::Bid(account_hash) => {
-                format!("{}{}", BID_PREFIX, base16::encode_lower(&account_hash))
+            Key::Bid(bid_addr) => {
+                format!("{}{}", BID_PREFIX, bid_addr)
             }
             Key::Withdraw(account_hash) => {
                 format!("{}{}", WITHDRAW_PREFIX, base16::encode_lower(&account_hash))
@@ -413,11 +423,52 @@ impl Key {
         }
 
         if let Some(hex) = input.strip_prefix(BID_PREFIX) {
-            let hash = checksummed_hex::decode(hex)
+            let bytes = checksummed_hex::decode(hex)
                 .map_err(|error| FromStrError::Bid(error.to_string()))?;
-            let account_hash = <[u8; ACCOUNT_HASH_LENGTH]>::try_from(hash.as_ref())
-                .map_err(|error| FromStrError::Bid(error.to_string()))?;
-            return Ok(Key::Bid(AccountHash::new(account_hash)));
+            let bytes_len = bytes.len();
+            if bytes_len == BidAddr::DELEGATOR_BID_ADDR_LENGTH {
+                let addr = <[u8; BidAddr::DELEGATOR_BID_ADDR_LENGTH]>::try_from(bytes.as_ref())
+                    .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                let tag_bytes =
+                    <[u8; BidAddrTag::BID_ADDR_TAG_LENGTH]>::try_from(addr[0..1].as_ref())
+                        .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                let tag = BidAddrTag::try_from_u8(tag_bytes[0])
+                    .ok_or_else(|| FromStrError::Bid("failed to parse bid addr tag".to_string()))?;
+                if tag == BidAddrTag::Delegator {
+                    let validator_bytes = <[u8; ACCOUNT_HASH_LENGTH]>::try_from(
+                        addr[1..BidAddr::VALIDATOR_BID_ADDR_LENGTH].as_ref(),
+                    )
+                    .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                    let delegator_bytes = <[u8; ACCOUNT_HASH_LENGTH]>::try_from(
+                        addr[BidAddr::VALIDATOR_BID_ADDR_LENGTH..].as_ref(),
+                    )
+                    .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                    let bid_addr = BidAddr::new_delegator_addr((validator_bytes, delegator_bytes));
+                    return Ok(bid_addr.into());
+                }
+            } else if bytes_len == BidAddr::VALIDATOR_BID_ADDR_LENGTH {
+                let addr = <[u8; BidAddr::VALIDATOR_BID_ADDR_LENGTH]>::try_from(bytes.as_ref())
+                    .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                let tag_bytes =
+                    <[u8; BidAddrTag::BID_ADDR_TAG_LENGTH]>::try_from(addr[0..1].as_ref())
+                        .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                let tag = BidAddrTag::try_from_u8(tag_bytes[0])
+                    .ok_or_else(|| FromStrError::Bid("failed to parse bid addr tag".to_string()))?;
+                if tag == BidAddrTag::Validator {
+                    let validator_bytes = <[u8; ACCOUNT_HASH_LENGTH]>::try_from(addr[1..].as_ref())
+                        .map_err(|err| FromStrError::Bid(err.to_string()))?;
+
+                    let bid_addr = BidAddr::new_validator_addr(validator_bytes);
+                    return Ok(bid_addr.into());
+                }
+            } else if bytes_len == BidAddr::VALIDATOR_BID_ADDR_LENGTH - 1 {
+                let addr = <[u8; BidAddr::VALIDATOR_BID_ADDR_LENGTH - 1]>::try_from(bytes.as_ref())
+                    .map_err(|err| FromStrError::Bid(err.to_string()))?;
+                let bid_addr = BidAddr::legacy(addr);
+                return Ok(bid_addr.into());
+            } else {
+                return Err(FromStrError::Bid("invalid length".to_string()));
+            }
         }
 
         if let Some(hex) = input.strip_prefix(WITHDRAW_PREFIX) {
@@ -579,12 +630,30 @@ impl Key {
         false
     }
 
-    /// Returns true if the key is of type [`Key::Account`].
-    pub fn is_account_key(&self) -> bool {
-        if let Key::Account(_) = self {
+    /// Returns true if the key is of type [`Key::Bid`].
+    pub fn is_balance_key(&self) -> bool {
+        if let Key::Balance(_) = self {
             return true;
         }
         false
+    }
+
+    /// Returns true if the key is of type [`Key::Bid`].
+    pub fn is_bid_key(&self) -> bool {
+        if let Key::Bid(_) = self {
+            return true;
+        }
+        false
+    }
+
+    /// Returns a reference to the inner `BidAddr` if `self` is of type [`Key::Bid`],
+    /// otherwise returns `None`.
+    pub fn as_bid_addr(&self) -> Option<&BidAddr> {
+        if let Self::Bid(addr) = self {
+            Some(addr)
+        } else {
+            None
+        }
     }
 }
 
@@ -604,7 +673,7 @@ impl Display for Key {
             Key::Balance(uref_addr) => {
                 write!(f, "Key::Balance({})", base16::encode_lower(uref_addr))
             }
-            Key::Bid(account_hash) => write!(f, "Key::Bid({})", account_hash),
+            Key::Bid(bid_addr) => write!(f, "Key::Bid({})", bid_addr),
             Key::Withdraw(account_hash) => write!(f, "Key::Withdraw({})", account_hash),
             Key::Dictionary(addr) => {
                 write!(f, "Key::Dictionary({})", base16::encode_lower(addr))
@@ -725,7 +794,12 @@ impl ToBytes for Key {
             Key::DeployInfo(_) => KEY_DEPLOY_INFO_SERIALIZED_LENGTH,
             Key::EraInfo(_) => KEY_ERA_INFO_SERIALIZED_LENGTH,
             Key::Balance(_) => KEY_BALANCE_SERIALIZED_LENGTH,
-            Key::Bid(_) => KEY_BID_SERIALIZED_LENGTH,
+            Key::Bid(bid_addr) => match bid_addr.tag() {
+                BidAddrTag::Unified => KEY_ID_SERIALIZED_LENGTH + bid_addr.serialized_length() - 1,
+                BidAddrTag::Validator | BidAddrTag::Delegator => {
+                    KEY_ID_SERIALIZED_LENGTH + bid_addr.serialized_length()
+                }
+            },
             Key::Withdraw(_) => KEY_WITHDRAW_SERIALIZED_LENGTH,
             Key::Dictionary(_) => KEY_DICTIONARY_SERIALIZED_LENGTH,
             Key::SystemContractRegistry => KEY_SYSTEM_CONTRACT_REGISTRY_SERIALIZED_LENGTH,
@@ -746,7 +820,14 @@ impl ToBytes for Key {
             Key::DeployInfo(deploy_hash) => deploy_hash.write_bytes(writer),
             Key::EraInfo(era_id) => era_id.write_bytes(writer),
             Key::Balance(uref_addr) => uref_addr.write_bytes(writer),
-            Key::Bid(account_hash) => account_hash.write_bytes(writer),
+            Key::Bid(bid_addr) => match bid_addr.tag() {
+                BidAddrTag::Unified => {
+                    let bytes = bid_addr.to_bytes()?;
+                    writer.extend(&bytes[1..]);
+                    Ok(())
+                }
+                BidAddrTag::Validator | BidAddrTag::Delegator => bid_addr.write_bytes(writer),
+            },
             Key::Withdraw(account_hash) => account_hash.write_bytes(writer),
             Key::Dictionary(addr) => addr.write_bytes(writer),
             Key::Unbond(account_hash) => account_hash.write_bytes(writer),
@@ -791,8 +872,16 @@ impl FromBytes for Key {
                 Ok((Key::Balance(uref_addr), rem))
             }
             tag if tag == KeyTag::Bid as u8 => {
-                let (account_hash, rem) = AccountHash::from_bytes(remainder)?;
-                Ok((Key::Bid(account_hash), rem))
+                match BidAddr::from_bytes(remainder) {
+                    // attempt new style first
+                    Ok((bid_addr, rem)) => Ok((bid_addr.into(), rem)),
+                    Err(_) => {
+                        // attempt legacy before failing
+                        let (account_hash, rem) = AccountHash::from_bytes(remainder)?;
+                        let bid_addr = BidAddr::legacy(account_hash.value());
+                        Ok((bid_addr.into(), rem))
+                    }
+                }
             }
             tag if tag == KeyTag::Withdraw as u8 => {
                 let (account_hash, rem) = AccountHash::from_bytes(remainder)?;
@@ -957,7 +1046,7 @@ mod serde_helpers {
         DeployInfo(&'a DeployHash),
         EraInfo(&'a EraId),
         Balance(&'a URefAddr),
-        Bid(&'a AccountHash),
+        Bid(&'a BidAddr),
         Withdraw(&'a AccountHash),
         Dictionary(&'a HashAddr),
         SystemContractRegistry,
@@ -977,7 +1066,7 @@ mod serde_helpers {
                 Key::DeployInfo(deploy_hash) => BinarySerHelper::DeployInfo(deploy_hash),
                 Key::EraInfo(era_id) => BinarySerHelper::EraInfo(era_id),
                 Key::Balance(uref_addr) => BinarySerHelper::Balance(uref_addr),
-                Key::Bid(account_hash) => BinarySerHelper::Bid(account_hash),
+                Key::Bid(bid_addr) => BinarySerHelper::Bid(bid_addr),
                 Key::Withdraw(account_hash) => BinarySerHelper::Withdraw(account_hash),
                 Key::Dictionary(addr) => BinarySerHelper::Dictionary(addr),
                 Key::SystemContractRegistry => BinarySerHelper::SystemContractRegistry,
@@ -999,7 +1088,7 @@ mod serde_helpers {
         DeployInfo(DeployHash),
         EraInfo(EraId),
         Balance(URefAddr),
-        Bid(AccountHash),
+        Bid(BidAddr),
         Withdraw(AccountHash),
         Dictionary(DictionaryAddr),
         SystemContractRegistry,
@@ -1019,7 +1108,7 @@ mod serde_helpers {
                 BinaryDeserHelper::DeployInfo(deploy_hash) => Key::DeployInfo(deploy_hash),
                 BinaryDeserHelper::EraInfo(era_id) => Key::EraInfo(era_id),
                 BinaryDeserHelper::Balance(uref_addr) => Key::Balance(uref_addr),
-                BinaryDeserHelper::Bid(account_hash) => Key::Bid(account_hash),
+                BinaryDeserHelper::Bid(bid_addr) => Key::Bid(bid_addr),
                 BinaryDeserHelper::Withdraw(account_hash) => Key::Withdraw(account_hash),
                 BinaryDeserHelper::Dictionary(addr) => Key::Dictionary(addr),
                 BinaryDeserHelper::SystemContractRegistry => Key::SystemContractRegistry,
@@ -1076,7 +1165,9 @@ mod tests {
     const DEPLOY_INFO_KEY: Key = Key::DeployInfo(DeployHash::from_raw([42; 32]));
     const ERA_INFO_KEY: Key = Key::EraInfo(EraId::new(42));
     const BALANCE_KEY: Key = Key::Balance([42; 32]);
-    const BID_KEY: Key = Key::Bid(AccountHash::new([42; 32]));
+    const UNIFIED_BID_KEY: Key = Key::Bid(BidAddr::legacy([42; 32]));
+    const VALIDATOR_BID_KEY: Key = Key::Bid(BidAddr::new_validator_addr([2; 32]));
+    const DELEGATOR_BID_KEY: Key = Key::Bid(BidAddr::new_delegator_addr(([2; 32], [9; 32])));
     const WITHDRAW_KEY: Key = Key::Withdraw(AccountHash::new([42; 32]));
     const DICTIONARY_KEY: Key = Key::Dictionary([42; 32]);
     const SYSTEM_CONTRACT_REGISTRY_KEY: Key = Key::SystemContractRegistry;
@@ -1092,7 +1183,9 @@ mod tests {
         DEPLOY_INFO_KEY,
         ERA_INFO_KEY,
         BALANCE_KEY,
-        BID_KEY,
+        UNIFIED_BID_KEY,
+        VALIDATOR_BID_KEY,
+        DELEGATOR_BID_KEY,
         WITHDRAW_KEY,
         DICTIONARY_KEY,
         SYSTEM_CONTRACT_REGISTRY_KEY,
@@ -1102,6 +1195,10 @@ mod tests {
         CHECKSUM_REGISTRY_KEY,
     ];
     const HEX_STRING: &str = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a";
+    const VALIDATOR_HEX_STRING: &str =
+        "010202020202020202020202020202020202020202020202020202020202020202";
+    const DELEGATOR_HEX_STRING: &str =
+        "0202020202020202020202020202020202020202020202020202020202020202020909090909090909090909090909090909090909090909090909090909090909";
 
     fn test_readable(right: AccessRights, is_true: bool) {
         assert_eq!(right.is_readable(), is_true)
@@ -1178,7 +1275,18 @@ mod tests {
             format!("{}", BALANCE_KEY),
             format!("Key::Balance({})", HEX_STRING)
         );
-        assert_eq!(format!("{}", BID_KEY), format!("Key::Bid({})", HEX_STRING));
+        assert_eq!(
+            format!("{}", UNIFIED_BID_KEY),
+            format!("Key::Bid({})", HEX_STRING)
+        );
+        assert_eq!(
+            format!("{}", VALIDATOR_BID_KEY),
+            format!("Key::Bid({})", VALIDATOR_HEX_STRING)
+        );
+        assert_eq!(
+            format!("{}", DELEGATOR_BID_KEY),
+            format!("Key::Bid({})", DELEGATOR_HEX_STRING)
+        );
         assert_eq!(
             format!("{}", WITHDRAW_KEY),
             format!("Key::Withdraw({})", HEX_STRING)
@@ -1261,8 +1369,16 @@ mod tests {
     fn key_max_serialized_length() {
         let mut got_max = false;
         for key in KEYS {
-            assert!(key.serialized_length() <= Key::max_serialized_length());
-            if key.serialized_length() == Key::max_serialized_length() {
+            let expected = Key::max_serialized_length();
+            let actual = key.serialized_length();
+            assert!(
+                actual <= expected,
+                "key too long {} expected {} actual {}",
+                key,
+                expected,
+                actual
+            );
+            if actual == Key::max_serialized_length() {
                 got_max = true;
             }
         }
@@ -1274,10 +1390,111 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_legacy_unified_bid_key_from_string() {
+        let legacy_bid_addr = BidAddr::legacy([1; 32]);
+        let legacy_bid_key = Key::Bid(legacy_bid_addr);
+        assert!(
+            legacy_bid_addr.tag() == BidAddrTag::Unified,
+            "legacy_bid_key should be legacy kind"
+        );
+
+        let original_string = legacy_bid_key.to_formatted_string();
+
+        let parsed_key =
+            Key::from_formatted_str(&original_string).expect("{string} (key = {key:?})");
+        let parsed_bid_addr = parsed_key.as_bid_addr().expect("must have bid addr");
+        assert!(parsed_key.is_bid_key(), "parsed_key should be bid key");
+        assert_eq!(
+            parsed_bid_addr.tag(),
+            legacy_bid_addr.tag(),
+            "bid addr tags should equal"
+        );
+        assert_eq!(*parsed_bid_addr, legacy_bid_addr, "bid addr's should equal");
+
+        let translated_string = parsed_key.to_formatted_string();
+        assert_eq!(original_string, translated_string, "strings should equal");
+
+        assert_eq!(
+            parsed_key.as_bid_addr(),
+            legacy_bid_key.as_bid_addr(),
+            "should equal"
+        );
+    }
+
+    #[test]
+    fn should_parse_validator_bid_key_from_string() {
+        let validator_bid_addr = BidAddr::new_validator_addr([1; 32]);
+        let validator_bid_key = Key::Bid(validator_bid_addr);
+        assert!(
+            validator_bid_addr.tag() == BidAddrTag::Validator,
+            "validator_bid_key should be validator kind"
+        );
+
+        let original_string = validator_bid_key.to_formatted_string();
+        let parsed_key =
+            Key::from_formatted_str(&original_string).expect("{string} (key = {key:?})");
+        let parsed_bid_addr = parsed_key.as_bid_addr().expect("must have bid addr");
+        assert!(parsed_key.is_bid_key(), "parsed_key should be bid key");
+        assert_eq!(
+            parsed_bid_addr.tag(),
+            validator_bid_addr.tag(),
+            "bid addr tags should equal"
+        );
+        assert_eq!(
+            *parsed_bid_addr, validator_bid_addr,
+            "bid addr's should equal"
+        );
+
+        let translated_string = parsed_key.to_formatted_string();
+        assert_eq!(original_string, translated_string, "strings should equal");
+
+        assert_eq!(
+            parsed_key.as_bid_addr(),
+            validator_bid_key.as_bid_addr(),
+            "should equal"
+        );
+    }
+
+    #[test]
+    fn should_parse_delegator_bid_key_from_string() {
+        let delegator_bid_addr = BidAddr::new_delegator_addr(([1; 32], [9; 32]));
+        let delegator_bid_key = Key::Bid(delegator_bid_addr);
+        assert!(
+            delegator_bid_addr.tag() == BidAddrTag::Delegator,
+            "delegator_bid_addr should be delegator kind"
+        );
+
+        let original_string = delegator_bid_key.to_formatted_string();
+
+        let parsed_key =
+            Key::from_formatted_str(&original_string).expect("{string} (key = {key:?})");
+        let parsed_bid_addr = parsed_key.as_bid_addr().expect("must have bid addr");
+        assert!(parsed_key.is_bid_key(), "parsed_key should be bid key");
+        assert_eq!(
+            parsed_bid_addr.tag(),
+            delegator_bid_addr.tag(),
+            "bid addr tags should equal"
+        );
+        assert_eq!(
+            *parsed_bid_addr, delegator_bid_addr,
+            "bid addr's should equal"
+        );
+
+        let translated_string = parsed_key.to_formatted_string();
+        assert_eq!(original_string, translated_string, "strings should equal");
+
+        assert_eq!(
+            parsed_key.as_bid_addr(),
+            delegator_bid_key.as_bid_addr(),
+            "should equal"
+        );
+    }
+
+    #[test]
     fn should_parse_key_from_str() {
         for key in KEYS {
             let string = key.to_formatted_string();
-            let parsed_key = Key::from_formatted_str(&string).unwrap();
+            let parsed_key = Key::from_formatted_str(&string).expect("{string} (key = {key:?})");
             assert_eq!(parsed_key, *key, "{string} (key = {key:?})");
         }
     }
@@ -1383,6 +1600,8 @@ mod tests {
             json!({ "EraInfo": "era-42" }),
             json!({ "Balance": format!("balance-{}", HEX_STRING) }),
             json!({ "Bid": format!("bid-{}", HEX_STRING) }),
+            json!({ "Bid": format!("bid-{}", VALIDATOR_HEX_STRING) }),
+            json!({ "Bid": format!("bid-{}", DELEGATOR_HEX_STRING) }),
             json!({ "Withdraw": format!("withdraw-{}", HEX_STRING) }),
             json!({ "Dictionary": format!("dictionary-{}", HEX_STRING) }),
             json!({
@@ -1433,7 +1652,8 @@ mod tests {
     fn serialization_roundtrip_json() {
         let round_trip = |key: &Key| {
             let encoded = serde_json::to_value(key).unwrap();
-            let decoded = serde_json::from_value(encoded).unwrap();
+            let decoded = serde_json::from_value(encoded.clone())
+                .unwrap_or_else(|_| panic!("{} {}", key, encoded));
             assert_eq!(key, &decoded);
         };
 
@@ -1442,6 +1662,7 @@ mod tests {
         }
 
         let zeros = [0; BLAKE2B_DIGEST_LENGTH];
+        let nines = [9; BLAKE2B_DIGEST_LENGTH];
 
         round_trip(&Key::Account(AccountHash::new(zeros)));
         round_trip(&Key::Hash(zeros));
@@ -1450,7 +1671,8 @@ mod tests {
         round_trip(&Key::DeployInfo(DeployHash::from_raw(zeros)));
         round_trip(&Key::EraInfo(EraId::from(0)));
         round_trip(&Key::Balance(URef::new(zeros, AccessRights::READ).addr()));
-        round_trip(&Key::Bid(AccountHash::new(zeros)));
+        round_trip(&Key::Bid(BidAddr::from(AccountHash::new(zeros))));
+        round_trip(&Key::Bid(BidAddr::new_delegator_addr((zeros, nines))));
         round_trip(&Key::Withdraw(AccountHash::new(zeros)));
         round_trip(&Key::Dictionary(zeros));
         round_trip(&Key::SystemContractRegistry);

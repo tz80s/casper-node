@@ -176,7 +176,6 @@ where
         access_rights: ContextAccessRights,
         runtime_args: RuntimeArgs,
     ) -> Self {
-        // debug_assert!(base_key != self.base_key);
         let entity = self.entity;
         let authorization_keys = self.authorization_keys.clone();
         let account_hash = self.account_hash;
@@ -591,6 +590,15 @@ where
             .map_err(Into::into)
     }
 
+    /// Returns all key's that start with prefix, if any.
+    pub fn get_keys_with_prefix(&mut self, prefix: &[u8]) -> Result<Vec<Key>, Error> {
+        self.tracking_copy
+            .borrow_mut()
+            .reader()
+            .keys_with_prefix(prefix)
+            .map_err(Into::into)
+    }
+
     /// Write a transfer instance to the global state.
     pub fn write_transfer(&mut self, key: Key, value: Transfer) {
         if let Key::Transfer(_) = key {
@@ -899,6 +907,17 @@ where
     {
         let amount: Gas = call_cost.into();
         self.charge_gas(amount)
+    }
+
+    /// Prune a key from the global state.
+    ///
+    /// Use with caution - there is no validation done as the key is assumed to be validated
+    /// already.
+    pub(crate) fn prune_gs_unsafe<K>(&mut self, key: K)
+    where
+        K: Into<Key>,
+    {
+        self.tracking_copy.borrow_mut().prune(key.into());
     }
 
     /// Writes data to global state with a measurement.

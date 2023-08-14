@@ -2,6 +2,7 @@ use alloc::string::String;
 use core::fmt::Debug;
 #[cfg(not(any(feature = "std", test)))]
 use core::fmt::{self, Display, Formatter};
+use k256::ecdsa::Error as EcdsaSignatureError;
 
 #[cfg(feature = "datasize")]
 use datasize::DataSize;
@@ -61,6 +62,12 @@ impl From<base16::DecodeError> for Error {
 
 impl From<SignatureError> for Error {
     fn from(_error: SignatureError) -> Self {
+        Error::SignatureError
+    }
+}
+
+impl From<EcdsaSignatureError> for Error {
+    fn from(_error: EcdsaSignatureError) -> Self {
         Error::SignatureError
     }
 }

@@ -3,9 +3,11 @@
 use std::{
     fs,
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use thiserror::Error;
 
@@ -64,10 +66,14 @@ pub(crate) fn write_private_file<P: AsRef<Path>, B: AsRef<[u8]>>(
     data: B,
 ) -> Result<(), WriteFileError> {
     let path = filename.as_ref();
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .mode(0o600)
+
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create(true);
+
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+
+    open_opts
         .open(path)
         .and_then(|mut file| file.write_all(data.as_ref()))
         .map_err(|error| WriteFileError {
